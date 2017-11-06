@@ -1,6 +1,7 @@
 from __future__ import unicode_literals
 
 import django
+from django.forms import ValidationError
 from django.utils.six import with_metaclass
 from django.forms.models import (
     BaseModelFormSet, modelformset_factory,
@@ -126,6 +127,93 @@ class BaseChildFormSet(BaseTransientModelFormSet):
             manager.commit()
 
         return saved_instances
+
+    def clean(self, *args, **kwargs):
+        '''This clean method will check for unique_together condition'''
+        forms = self.forms
+        # Directly return if there's no forms
+        if not len(forms):
+            return
+        # Don't bother validating the formset unless each form is valid
+        if any(self.errors):
+            return
+
+        unique_together = self.model._meta.unique_together
+        # Don't check integrity if no unique_together is defined
+        if not len(unique_together):
+            return
+
+        # fk stands for Form Keys
+        fk = forms[0].instance.__dict__.keys()
+
+        # form instance foreign keys are set as ids during form processing
+        # this just convert fk fields names to they '_id' name if needed
+        unique_together = [
+            [
+                k if k in fk else k + '_id' if k + '_id' in fk else None
+                for k in ut
+            ]
+            for ut in unique_together
+        ]
+
+        # Check that all constraints keys are available in for instances
+        for uts in unique_together:
+            for v in uts:
+                if v is None:
+                    # This mean it's not possible to retrieve constraints key
+                    # in form instances, so it's impossible to check for
+                    # integrity
+                    return
+
+        this = None
+        found = False
+        # Retrieve this instance key if exists
+        for f in forms:
+            for k, v in f.instance.__dict__.items():
+                if v == self.instance:
+                    # if instance is present -from a old record- then it will
+                    # be available in form instance dict key as:
+                    # '_' + <field_name> + '_cache'
+                    id_k = k[1:-5] + 'id'
+                    if id_k in fk:
+                        this = id_k
+                        found = True
+                        break
+            if found:
+                break
+
+        # Check for unique together integrity
+        for ut in unique_together:
+            vals = []
+            for f in forms:
+                # Don't check for deleted forms
+                if f in self.deleted_forms:
+                    continue
+                i = f.instance
+                v = [
+                    # replace by instance id when relevant
+                    getattr(i, k) if k != this else self.instance.id
+                    for k in ut
+                ]
+                # ignore None values
+                v = [e for e in v if e is not None]
+                if v in vals:
+                    # construct a simple error message
+                    msg = ', '.join([
+                        k if not k.endswith('_id') else k[:-3]
+                        for k in ut[:-1]
+                    ])
+
+                    last = ut[-1]
+                    last = last if not last.endswith('_id') else last[:-3]
+
+                    msg = ' and '.join([msg, last])
+
+                    raise ValidationError(msg + ' must be unique together.')
+                if len(v):
+                    vals.append(v)
+
+        return super(BaseChildFormSet, self).clean(*args, **kwargs)
 
 
 def childformset_factory(
